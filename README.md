@@ -104,6 +104,7 @@ If you use this code for your research, please cite our paper:
 @article{foroutan-meister-et-al-2025-parity-aware-bpe,
   title={Parity-Aware Byte-Pair Encoding: Improving Cross-lingual Fairness in Tokenization},
   author={Foroutan, Negar and Meister, Clara and Paul, Debjit and Niklaus, Joel and Ahmadi, Sina, and Bosselut, Antoine and Sennrich, Rico},
+  url={https://arxiv.org/abs/2508.04796},
   booktitle={arXiv},
   year={2025}
 }
