@@ -92,6 +92,24 @@ Python3 parity_aware_bpe/HF_tokenizer.py \
 
 ```
 
+Loading the tokenizer
+------------------
+```python
+import os
+from transformers import PreTrainedTokenizerFast
+from tokenizers.pre_tokenizers import Whitespace, ByteLevel
+from tokenizers.models import BPE
+from tokenizers import Tokenizer, pre_tokenizers
+
+merge_file = os.path.join(tokenizer_path, "merges.txt")
+vocab_file = os.path.join(tokenizer_path, "vocab.json")
+tokenizer = Tokenizer(BPE(vocab=vocab_file, merges=merge_file))
+
+wrapped_tokenizer = PreTrainedTokenizerFast(tokenizer_object=tokenizer)
+pre_tokenizer = pre_tokenizers.Sequence([Whitespace(), ByteLevel(use_regex=False)]) # You need to use the same pre_tokenizer as the one used in BPE training
+wrapped_tokenizer.pre_tokenizer = pre_tokenizer
+```
+
 Intrinsic Evaluation
 ------------------
 For our intrinsic evaluation, we use `Tok##Suite`  to analyze and compare tokenizers across multiple languages and metrics. You can find the evaluation suite [here](https://github.com/cimeister/tokenizer-analysis-suite).
