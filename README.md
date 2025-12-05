@@ -104,10 +104,10 @@ from tokenizers import Tokenizer, pre_tokenizers
 merge_file = os.path.join(tokenizer_path, "merges.txt")
 vocab_file = os.path.join(tokenizer_path, "vocab.json")
 tokenizer = Tokenizer(BPE(vocab=vocab_file, merges=merge_file))
+pre_tokenizer = pre_tokenizers.Sequence([Whitespace(), ByteLevel(use_regex=False)]) # You need to use the same pre_tokenizer as the one used in BPE training
+tokenizer.pre_tokenizer = pre_tokenizer
 
 wrapped_tokenizer = PreTrainedTokenizerFast(tokenizer_object=tokenizer)
-pre_tokenizer = pre_tokenizers.Sequence([Whitespace(), ByteLevel(use_regex=False)]) # You need to use the same pre_tokenizer as the one used in BPE training
-wrapped_tokenizer.pre_tokenizer = pre_tokenizer
 ```
 
 Intrinsic Evaluation
