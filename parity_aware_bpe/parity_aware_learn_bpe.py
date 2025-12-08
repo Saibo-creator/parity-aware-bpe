@@ -742,9 +742,14 @@ def learn_bpe_moving_window(infiles, outfile, devfiles, num_symbols, window_size
           "\n  num_symbols: {0}, min_frequency: {1}, verbose: {2}, is_dict: {3}, total_symbols: {4}, num_global: {5}, num_workers: {6}".format(
               num_symbols, min_frequency, verbose, is_dict, total_symbols, num_global, num_workers))
     
-    # version numbering allows bckward compatibility
-    if bpe_file is None:
+    # if continuing learning on top of existing BPE file, contents of BPE file are included in output
+    if bpe_file:
+        outfile.write(bpe_file.read())
+        bpe_file.seek(0)
+    else:
+        # version numbering allows bckward compatibility
         outfile.write('#version: 0.2\n')
+
     dev_vocab, sorted_vocab, stats, indices, big_stats, threshold, lengths, array_length = \
         preprocess_input_data(infiles, devfiles, is_dict, total_symbols, num_global, num_workers, bpe_file)
 
