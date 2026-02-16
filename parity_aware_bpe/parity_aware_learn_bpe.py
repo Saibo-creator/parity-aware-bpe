@@ -21,29 +21,22 @@ import functools
 import operator
 import numpy
 import logging
+import numpy as np
 
 from multiprocessing import Pool, cpu_count
 from collections import defaultdict, Counter, deque
 from contextlib import contextmanager
 
-# Create a logger
-logger = logging.getLogger(__name__)
-logger.setLevel(logging.INFO)
-
-# Create console handler and set level to info
-ch = logging.StreamHandler()
-ch.setLevel(logging.INFO)
-
-# Create formatter
-formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-ch.setFormatter(formatter)
-
-# Add handler to logger
-logger.addHandler(ch)
-
 from tokenizers.pre_tokenizers import Whitespace, ByteLevel
 from tokenizers import pre_tokenizers
+from tokenizers import Tokenizer, models, decoders, normalizers
+from tokenizers.processors import TemplateProcessing
+SPECIAL_TOKENS = ["<s>", "<pad>", "</s>", "<unk>"]
 
+# Create a logger
+logger = logging.getLogger(__name__)
+pre_tokenizer = pre_tokenizers.Sequence([Whitespace(), ByteLevel(use_regex=False, add_prefix_space=True)])
+decoder = decoders.ByteLevel()
 
 
 try:
@@ -52,6 +45,26 @@ try:
 except ImportError:
     def tqdm(iterator, *args, **kwargs):
         return iterator
+
+
+def set_logger(verbose=True):
+    if verbose:
+        level = logging.INFO
+    else: 
+        level = logging.WARN
+    logger.setLevel(level)
+
+    # Create console handler and set level to info
+    ch = logging.StreamHandler()
+    ch.setLevel(level)
+
+    # Create formatter
+    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    ch.setFormatter(formatter)
+
+    # Add handler to logger
+    logger.addHandler(ch)
+
 
 def create_parser(subparsers=None):
 
@@ -83,6 +96,10 @@ def create_parser(subparsers=None):
         metavar='PATH',
         help="Output file for BPE codes (default: standard output)")
     parser.add_argument(
+        '--json-output', '-j', type=str, default=None,
+        metavar='PATH',
+        help="Output file for Hugging Face tokenizer.json (default: None)")
+    parser.add_argument(
         '--symbols', '-s', type=int, default=10000,
         help="Create this many new symbols (each representing a character n-gram) (default: %(default)s)")
     parser.add_argument(
@@ -97,7 +114,6 @@ def create_parser(subparsers=None):
         help="Preload merges from BPE file (default: None). Can be used to continue learning with different settings (e.g. without whitespace pre-tokenization for SuperBPE).")
     parser.add_argument(
         '--pretokenize', type=str, default=['whitespace', 'bytelevel'], nargs='*',
-        # metavar='STR',
         choices=['whitespace', 'bytelevel'],
         help="Huggingface pre-tokenizer(s) to apply. (default: %(default)s)")
     parser.add_argument('--dict-input', action="store_true",
@@ -127,7 +143,7 @@ def get_vocabulary(fobj, is_dict=False, num_workers=1):
         is_dict (bool): If True, the input is treated as a dictionary file.
         num_workers (int): The number of worker processes to use for parallel processing.
     Returns:
-        Counter: A Counter object mapping words to their frequencies.
+        Counter: A Counter object mapping tuple(word) to their frequencies.
     """
     vocab = Counter()
 
@@ -141,7 +157,7 @@ def get_vocabulary(fobj, is_dict=False, num_workers=1):
             except:
                 print('Failed reading vocabulary file at line {0}: {1}'.format(i, line))
                 sys.exit(1)
-            vocab[word] += int(count)
+            vocab[tuple(word)] += int(count)
     elif num_workers == 1 or fobj.name == '<stdin>':
         if num_workers > 1:
             warnings.warn("In parallel mode, the input cannot be STDIN. Using 1 processor instead.")
@@ -150,67 +166,93 @@ def get_vocabulary(fobj, is_dict=False, num_workers=1):
             split_line = [item[0] for item in pre_tokenizer.pre_tokenize_str(line)]
             for word in split_line:
                 if word:
-                    vocab[word] += 1
+                    vocab[tuple(word)] += 1
             
     elif num_workers > 1:
 
-        with open_file(fobj.name, 'r') as f:
+        with open_file(fobj.name, 'rb') as f: 
             size = os.fstat(f.fileno()).st_size
             chunk_size = int(size / num_workers)
             offsets = [0 for _ in range(num_workers + 1)]
+            
+            # Set the final offset to the end of the file
+            offsets[num_workers] = size 
+
             for i in range(1, num_workers):
                 f.seek(chunk_size * i)
                 pos = f.tell()
-                while True:
-                    try:
-                        line = f.readline()
-                        break
-                    except UnicodeDecodeError:
-                        pos -= 1
-                        f.seek(pos)
+                
+                # Read to the next line break
+                f.readline()
+                
                 offsets[i] = f.tell()
-                assert 0 <= offsets[i] < 1e20, "Bad new line separator, e.g. '\\r'"
+                assert 0 <= offsets[i] < 1e20, "Bad new line separator"
 
-        vocab_files = []
         pool = Pool(processes=num_workers)
+        results = []
         for i in range(num_workers):
-            tmp = tempfile.NamedTemporaryFile(delete=False)
-            tmp.close()
-            vocab_files.append(tmp)
-            pool.apply_async(_get_vocabulary, (fobj.name, tmp.name, offsets[i], offsets[i + 1]))
+            # Pass the file *name* and offsets to the worker
+            res = pool.apply_async(_get_vocabulary, (fobj.name, offsets[i], offsets[i + 1]))
+            results.append(res)
         
         pool.close()
         pool.join()
-        import pickle
-        for i in range(num_workers):
-            with open(vocab_files[i].name, 'r') as f:
-                vocab += pickle.load(f)
-            os.remove(vocab_files[i].name)
+
+        # Collect results and sum the Counters
+        for res in results:
+            worker_vocab = res.get()
+            vocab.update(worker_vocab)
+            
     else:
         raise ValueError('`num_workers` is expected to be a positive number, but got {}.'.format(num_workers))
     return vocab
 
-def _get_vocabulary(infile, outfile, begin, end):
-    import pickle
+def _get_vocabulary(infile, begin, end):
     vocab = Counter()
-    with open_file(infile, 'r') as f:
+    
+    # Open in binary mode to use the byte offsets
+    with open_file(infile, 'rb') as f:
         f.seek(begin)
-        line = f.readline()
-        while line:
+        
+        # Read the first line (as bytes)
+        line_bytes = f.readline() 
+        
+        while line_bytes:
             pos = f.tell()
             assert 0 <= pos < 1e20, "Bad new line separator, e.g. '\\r'"
-            if end > 0 and pos > end:
+            # Stop if we've read past the end offset
+            if end > 0 and pos > end: 
                 break
-            split_line = [item[0] for item in pre_tokenizer.pre_tokenize_str(line)]
-            for word in split_line:
-                if word:
-                    vocab[word] += 1
-            line = f.readline()
-    with open(outfile, 'w') as f:
-        pickle.dump(vocab, f)
+                
+            # Decode the bytes into a string
+            try:
+                line_str = line_bytes.decode('utf-8', errors='strict')
+            except UnicodeDecodeError as e:
+                logger.warning(f"Skipping line with invalid UTF-8 at position {f.tell()}: {e}")
+                line_bytes = f.readline() 
+                continue 
+            
+            split_line = [item[0] for item in pre_tokenizer.pre_tokenize_str(line_str)]
+            for word_str in split_line:
+                if word_str:
+                    vocab[tuple(word_str)] += 1
+                        
+            # Read the next line (as bytes)
+            line_bytes = f.readline() 
+            
+    # Return the Counter directly
+    return vocab
+
 
 def pre_merge(vocab, bpe_codes):
-    """Apply list of BPE merge operations to each item in vocab
+    """Apply list of BPE merge operations to each item in vocab.
+    
+    Args:
+        vocab (Counter): mapping from tuple(chars) -> count (tuple-keyed).
+        bpe_codes (dict): mapping from (str, str) pair -> merge rank.
+    
+    Returns:
+        Counter: new vocab with merges applied, still tuple-keyed.
     """
 
     new_vocab = Counter()
@@ -219,105 +261,40 @@ def pre_merge(vocab, bpe_codes):
 
         if len(orig) == 1:
             new_vocab[orig] = vocab[orig]
+            continue
 
-        word = list(orig[:-1]) + [orig[-1]]
+        word = list(orig)
 
         while len(word) > 1:
 
             # get list of symbol pairs; optionally apply dropout
-            pairs = [(bpe_codes[pair],i,pair) for (i,pair) in enumerate(zip(word, word[1:])) if pair in bpe_codes]
+            pairs = [(bpe_codes[pair], i, pair) for (i, pair) in enumerate(zip(word, word[1:])) if pair in bpe_codes]
 
             if not pairs:
                 break
 
-            #get first merge operation in list of BPE codes
+            # get first merge operation in list of BPE codes
             bigram = min(pairs)[2]
 
             # find start position of all pairs that we want to merge
-            positions = [i for (rank,i,pair) in pairs if pair == bigram]
+            positions = [i for (rank, i, pair) in pairs if pair == bigram]
 
             i = 0
             new_word = []
-            bigram = ''.join(bigram)
+            bigram_str = ''.join(bigram)
             for j in positions:
                 # merges are invalid if they start before current position. This can happen if there are overlapping pairs: (x x x -> xx x)
                 if j < i:
                     continue
                 new_word.extend(word[i:j]) # all symbols before merged pair
-                new_word.append(bigram) # merged pair
-                i = j+2 # continue after merged pair
+                new_word.append(bigram_str) # merged pair
+                i = j + 2 # continue after merged pair
             new_word.extend(word[i:]) # add all symbols until end of word
             word = new_word
 
-        word = tuple(word)
-        new_vocab[word] = vocab[orig]
+        new_vocab[tuple(word)] = vocab[orig]
 
     return new_vocab
-
-def update_pair_statistics(pair, changed, stats, indices):
-    """ Minimally updates the indices and frequency of symbol pairs.
-    If we merge a pair of symbols, only pairs that overlap with occurrences
-    of this pair are affected, and need to be updated.
-
-    Args:
-        pair (tuple): A tuple of two characters (first, second) that form the pair to be updated.
-        changed (list): A list of changes made, where each change is a tuple containing the index of the word, the new word, the old word, and its frequency.
-        stats (defaultdict): A dictionary mapping symbol pairs (tuples) to their frequencies (numpy arrays).
-        indices (defaultdict): A dictionary mapping symbol pairs (tuples) to their indices (defaultdicts).
-    Returns:
-        None: The function updates the `stats` and `indices` dictionaries in place.
-    """
-    stats[pair] = 0
-    indices[pair] = defaultdict(int)
-    first, second = pair
-    new_pair = first+second
-    for j, word, old_word, freq in changed:
-
-        # find all instances of pair, and update frequency/indices around it
-        i = 0
-        while True:
-            # find first symbol
-            try:
-                i = old_word.index(first, i)
-            except ValueError:
-                break
-            # if first symbol is followed by second symbol, we've found an occurrence of pair (old_word[i:i+2])
-            if i < len(old_word)-1 and old_word[i+1] == second:
-                # assuming a symbol sequence "A B C", if "B C" is merged, reduce the frequency of "A B"
-                if i:
-                    prev = old_word[i-1:i+1]
-                    stats[prev] -= freq
-                    indices[prev][j] -= 1
-                if i < len(old_word)-2:
-                    # assuming a symbol sequence "A B C B", if "B C" is merged, reduce the frequency of "C B".
-                    # however, skip this if the sequence is A B C B C, because the frequency of "C B" will be reduced by the previous code block
-                    if old_word[i+2] != first or i >= len(old_word)-3 or old_word[i+3] != second:
-                        nex = old_word[i+1:i+3]
-                        stats[nex] -= freq
-                        indices[nex][j] -= 1
-                i += 2
-            else:
-                i += 1
-
-        i = 0
-        while True:
-            try:
-                # find new pair
-                i = word.index(new_pair, i)
-            except ValueError:
-                break
-            # assuming a symbol sequence "A BC D", if "B C" is merged, increase the frequency of "A BC"
-            if i:
-                prev = word[i-1:i+1]
-                stats[prev] += freq
-                indices[prev][j] += 1
-            # assuming a symbol sequence "A BC B", if "B C" is merged, increase the frequency of "BC B"
-            # however, if the sequence is A BC BC, skip this step because the count of "BC BC" will be incremented by the previous code block
-            if i < len(word)-1 and word[i+1] != new_pair:
-                nex = word[i:i+2]
-                stats[nex] += freq
-                indices[nex][j] += 1
-            i += 1
 
 
 def get_pair_statistics(vocab):
@@ -337,48 +314,82 @@ def get_pair_statistics(vocab):
     indices = defaultdict(lambda: defaultdict(int))
 
     for i, (word, freq) in enumerate(vocab):
-        prev_char = word[0]
-        for char in word[1:]:
-            stats[prev_char, char] += freq
-            indices[prev_char, char][i] += 1
-            prev_char = char
+        for p in zip(word[0:-1], word[1:]):
+            stats[p] += freq
+            indices[p][i] += 1
 
     return stats, indices
 
 
-def replace_pair(pair, vocab, indices):
-    """ Replaces all occurrences of a symbol pair ('A', 'B') with a new symbol 'AB'
-    Args:
-        pair (tuple): A tuple of two characters (first, second) that form the pair to be replaced.
-        vocab (defaultdict): A dictionary mapping words (tuples of characters) to their frequencies in each language.
-        indices (defaultdict): A dictionary mapping pairs of characters to their indices in the vocabulary.
-    Returns:
-        list: A list of changes made, where each change is a tuple containing the index of the word, the new word, the old word, and its frequency.
+def count_adjacent_pairs_tuple(word):
+    """Returns dict[(sym,sym)] -> count for adjacent pairs in word tuple."""
+    d = {}
+    if len(word) < 2:
+        return d
+    prev = word[0]
+    for cur in word[1:]:
+        key = (prev, cur)
+        d[key] = d.get(key, 0) + 1
+        prev = cur
+    return d
+
+def replace_pair(pair, vocab, indices, stats, word_pair_counts):
     """
-    split_char = ' '
+    Replaces all ('A','B') with 'AB' in vocab entries referenced by indices[pair],
+    and applies stats/indices updates inline using per-word pair-count deltas.
+    Returns the usual `changes` list for compatibility.
+    """
     first, second = pair
-    
-    pair_str = ''.join(pair)
-    pair_str = pair_str.replace('\\','\\\\')
-    pattern = re.compile(r'(?<!\S)' + re.escape(first + ' ' + second) + r'(?!\S)')
+    merged = first + second
     changes = []
 
-    if sys.version_info < (3, 0):
-        iterator = indices[pair].iteritems()
-    else:
-        iterator = indices[pair].items()
-    for j, freq in iterator:
-        if freq < 1:
-            continue
-        word, freq = vocab[j]
-        new_word = split_char.join(word)
-        new_word = pattern.sub(pair_str, new_word)
-        new_word = tuple(new_word.split(split_char))
+    def merge_tuple(word, a, b, ab):
+        n = len(word)
+        if n < 2:
+            return word
+        out = []
+        i = 0
+        while i < n:
+            if i + 1 < n and word[i] == a and word[i + 1] == b:
+                out.append(ab)
+                i += 2
+            else:
+                out.append(word[i])
+                i += 1
+        return tuple(out)
 
-        vocab[j] = (new_word, freq)
-        changes.append((j, new_word, word, freq))
+    # Only iterate over words that actually contain the pair, per indices[pair]
+    for j, occ in list(indices[pair].items()):
+        if occ < 1:
+            continue
+
+        old_word, wfreq = vocab[j]
+        new_word = merge_tuple(old_word, first, second, merged)
+        if new_word == old_word:
+            continue
+
+        # compute new adjacent-pair multiset
+        old_pairs = word_pair_counts[j]
+        new_pairs = count_adjacent_pairs_tuple(new_word)
+
+        # two-way delta to minimize dict hits
+        touched = set(old_pairs.keys()) | set(new_pairs.keys())
+        for p in touched:
+            old_c = old_pairs.get(p, 0)
+            new_c = new_pairs.get(p, 0)
+            d = new_c - old_c
+            if d == 0:
+                continue
+            stats[p] += d * wfreq
+            indices[p][j] += d
+
+        # commit new state
+        vocab[j] = (new_word, wfreq)
+        word_pair_counts[j] = new_pairs
+        changes.append((j, new_word, old_word, wfreq))
 
     return changes
+
 
 def prune_stats(stats, big_stats, threshold, full_sync=False):
     """ Prunes statistics dict for efficiency of max(). 
@@ -395,39 +406,73 @@ def prune_stats(stats, big_stats, threshold, full_sync=False):
                 big_stats[item] = freq
 
 
-def replace_pair_dict(pair, vocab):
-    """ Replaces all occurrences of a symbol pair ('A', 'B') with a new symbol 'AB'.
-    Args:
-        pair (tuple): A tuple of two characters (first, second) that form the pair to be replaced.
-        vocab (defaultdict): A dictionary mapping words (tuples of characters) to their frequencies in each language.
-    Returns:
-        numpy.ndarray: An array where each element corresponds to the change in text length (the sum of frequency*length for all vocab items) for each language.
+def _merge_tuple(word, a, b, ab):
+    """Helper to merge adjacent (a, b) into ab within a word tuple."""
+    n = len(word)
+    if n < 2:
+        return word
+    out = []
+    i = 0
+    while i < n:
+        if i + 1 < n and word[i] == a and word[i + 1] == b:
+            out.append(ab)
+            i += 2
+        else:
+            out.append(word[i])
+            i += 1
+    return tuple(out)
+
+def replace_pair_dict(pair, vocab, indices):
     """
-    length_change = None
-    split_char = ' '
+    Optimized in-place merge over the dev vocab dict.
+     - vocab:   defaultdict[tuple -> np.ndarray]
+     - indices: defaultdict[pair -> set[tuple]]
+    """
     first, second = pair
+    merged = first + second
+    length_change = None
 
-    pair_str = ''.join(pair)
-    pair_str = pair_str.replace('\\','\\\\')
-    pattern = re.compile(r'(?<!\S)' + re.escape(first + ' ' + second) + r'(?!\S)')
+    # Iterate over a static list since we modify indices during the loop
+    words_to_process = list(indices[pair])
 
-    for word, freq in list(vocab.items()):
-        if first in word and second in word and pair in zip(word, word[1:]):
-            new_word = split_char.join(word)
-            new_word = pattern.sub(pair_str, new_word)
-            new_word = tuple(new_word.split(split_char))
-            del vocab[word]
-            vocab[new_word] = freq
+    for old_word in words_to_process:
+        
+        # Word may have been deleted by a previous merge in this same loop
+        if old_word not in vocab:
+            continue
+            
+        freq = vocab[old_word]
+        new_word = _merge_tuple(old_word, first, second, merged)
 
-            if length_change is None:
-                length_change = numpy.zeros(len(freq), dtype=int)
+        if new_word == old_word:
+            continue
+            
+        del vocab[old_word]
+        vocab[new_word] += freq  
 
-            length_change += (len(word)-len(new_word))*freq
+        # Track length change
+        if length_change is None:
+            length_change = np.zeros(len(freq), dtype=int)
+        length_change += (len(old_word) - len(new_word)) * freq
+
+        # Update indices map: remove old_word from all pair indices
+        old_pairs = count_adjacent_pairs_tuple(old_word)
+        for p in old_pairs:
+            if p in indices and old_word in indices[p]:
+                indices[p].remove(old_word)
+                if not indices[p]:
+                    del indices[p]
+
+        # Add new_word to all pair indices
+        new_pairs = count_adjacent_pairs_tuple(new_word)
+        for p in new_pairs:
+            indices[p].add(new_word)
 
     if length_change is None:
         length_change = 0
 
     return length_change
+
 
 @contextmanager
 def open_file(filename, mode):
@@ -450,21 +495,22 @@ def preprocess_input_data(infiles, devfiles, is_dict=False, total_symbols=False,
         total_symbols (bool): Whether to count total symbols.
         num_global (int): The number of global symbols.
         num_workers (int): The number of worker threads to use.
-        bpe_file (fobj): file containing merge operations to pre-apply before learning
+        bpe_file (fobj): file containing merge operations to pre-apply before learning.
     Returns:
         tuple: A tuple containing:
             - dev_vocab (defaultdict): A dictionary mapping subwords to their frequencies in the development set.
+            - dev_indices (defaultdict): A dictionary mapping pairs to sets of words in dev_vocab.
             - sorted_vocab (list): A sorted list of tuples, where each tuple contains a subword and its frequency in each language.
             - stats (defaultdict): A dictionary mapping symbol pairs (tuples) to their frequencies (numpy arrays).
+            - word_pair_counts (list): Per-word adjacent pair count dicts for sorted_vocab.
             - indices (defaultdict): A dictionary mapping symbol pairs (tuples) to their indices (defaultdicts).
             - big_stats (defaultdict): A dictionary containing full statistics for all symbol pairs.
             - threshold (numpy.ndarray): An array of thresholds for pruning statistics.
-            - lengths (numpy.ndarray): An array where each element corresponds to the sum of frequency*length for all vocab items in the development set.
+            - lengths (numpy.ndarray or None): An array where each element corresponds to the sum of frequency*length for all vocab items in the development set.
             - array_length (int): The length of the vocabulary array, which is the number of languages plus one for concatenation.
     """
 
-    if not bpe_file is None:
-        
+    if bpe_file is not None:
         # ignore first line containing version information (if it exists)
         line = bpe_file.readline()
         offset = 1
@@ -481,7 +527,7 @@ def preprocess_input_data(infiles, devfiles, is_dict=False, total_symbols=False,
                 sys.exit(1)
 
         # some hacking to deal with duplicates (only consider first instance)
-        bpe_codes = dict([(code,i) for (i,code) in reversed(list(enumerate(bpe_codes)))])
+        bpe_codes = dict([(code, i) for (i, code) in reversed(list(enumerate(bpe_codes)))])
     else:
         bpe_codes = None
 
@@ -489,9 +535,8 @@ def preprocess_input_data(infiles, devfiles, is_dict=False, total_symbols=False,
     joint_keys = set()
     for f in infiles:
         vocab = get_vocabulary(f, is_dict, num_workers)
-        if not bpe_codes is None:
+        if bpe_codes is not None:
             vocab = pre_merge(vocab, bpe_codes)
-        vocab = dict([(tuple(x,) ,y) for (x,y) in vocab.items()])
         vocabs.append(vocab)
         joint_keys = joint_keys.union(vocab.keys())
 
@@ -500,37 +545,43 @@ def preprocess_input_data(infiles, devfiles, is_dict=False, total_symbols=False,
     if devfiles:
         for f in devfiles:
             vocab = get_vocabulary(f, is_dict, num_workers)
-            if not bpe_codes is None:
+            if bpe_codes is not None:
                 vocab = pre_merge(vocab, bpe_codes)
-            vocab = dict([(tuple(x,) ,y) for (x,y) in vocab.items()])
-            
             dev_vocabs.append(vocab)
             dev_keys = dev_keys.union(vocab.keys())
+
     array_length = len(vocabs)
     if num_global:
         array_length += 1
 
     # merge vocabularies. Data structure maps from subword to list of frequency in each language, plus one for concatenation
-    vocab = defaultdict(lambda: numpy.zeros(array_length,dtype=int))
-    for i in range(len(vocabs)):
-        for key in joint_keys:
-            vocab[key][i] = vocabs[i].get(key, 0)
+    vocab = defaultdict(lambda: numpy.zeros(array_length, dtype=int))
+    for i, v in enumerate(vocabs):
+        for key, cnt in v.items():
+            vocab[key][i] = cnt
 
     if num_global:
         for key in joint_keys:
             vocab[key][-1] = sum(vocab[key])
 
-    # merge dev vocabularies. Data structure maps from subword to list of frequency*word_length in each language
-    dev_vocab = defaultdict(lambda: numpy.zeros(len(dev_vocabs),dtype=int))
+    # merge dev vocabularies. Data structure maps from subword to list of frequency in each language
+    dev_vocab = defaultdict(lambda: numpy.zeros(len(dev_vocabs), dtype=int))
     
     if dev_vocabs:
-        for i in range(len(dev_vocabs)):
-            for key in dev_keys:
-                dev_vocab[key][i] = dev_vocabs[i].get(key, 0)
+        for i, v in enumerate(dev_vocabs):
+            for key, cnt in v.items():
+                dev_vocab[key][i] = cnt
+
+    dev_indices = defaultdict(set)
+    for word, freq in dev_vocab.items():
+        for p in zip(word[0:-1], word[1:]):
+            dev_indices[p].add(word)
 
     sorted_vocab = sorted(vocab.items(), key=lambda x: sum(x[1]), reverse=True)
     stats, indices = get_pair_statistics(sorted_vocab)
     big_stats = copy.deepcopy(stats)
+
+    word_pair_counts = [count_adjacent_pairs_tuple(word) for (word, _freq) in sorted_vocab]
 
     if total_symbols:
         uniq_char_internal = set()
@@ -542,10 +593,10 @@ def preprocess_input_data(infiles, devfiles, is_dict=False, total_symbols=False,
         sys.stderr.write('Number of word-internal characters: {0}\n'.format(len(uniq_char_internal)))
         sys.stderr.write('Number of word-final characters: {0}\n'.format(len(uniq_char_final)))
         sys.stderr.write('Reducing number of merge operations by {0}\n'.format(len(uniq_char_internal) + len(uniq_char_final)))
-        num_symbols -= len(uniq_char_internal) + len(uniq_char_final)
+        # num_symbols -= len(uniq_char_internal) + len(uniq_char_final)
 
     # threshold is inspired by Zipfian assumption, but should only affect how often we re-sync with full big_stats
-    threshold = numpy.zeros(array_length,dtype=int)
+    threshold = numpy.zeros(array_length, dtype=float)
     for l in range(array_length):
         threshold[l] = stats[max(stats, key=lambda x: (stats[x][l], x))][l] / 10
 
@@ -553,7 +604,56 @@ def preprocess_input_data(infiles, devfiles, is_dict=False, total_symbols=False,
         lengths = functools.reduce(numpy.add, [len(key)*value for key, value in dev_vocab.items()])
     else:
         lengths = None
-    return (dev_vocab, sorted_vocab, stats, indices, big_stats, threshold, lengths, array_length)
+    return (dev_vocab, dev_indices, sorted_vocab, stats, word_pair_counts, indices, big_stats, threshold, lengths, array_length)
+
+
+def save_tokenizer_json(path, vocab, merges, unk_token="<unk>", special_tokens=None):
+    """
+    Saves the learned vocab and merges to a Hugging Face tokenizer.json file.
+    
+    Args:
+        path (str): The file path to save to.
+        vocab (dict): The complete vocabulary (str -> int).
+        merges (list): The list of merge rules as (str, str) tuples.
+        unk_token (str): The unknown token.
+        special_tokens (list): List of special token strings.
+    """
+    if special_tokens is None:
+        special_tokens = SPECIAL_TOKENS
+
+    # 1. Create the BPE model from the learned vocab and merges
+    bpe_model = models.BPE(
+        vocab=vocab,
+        merges=merges,
+        unk_token=unk_token
+    )
+
+    # 2. Create the Tokenizer
+    tokenizer = Tokenizer(bpe_model)
+    tokenizer.pre_tokenizer = pre_tokenizer 
+
+    # 3. Set the Decoder (must match pre-tokenizer ByteLevel)
+    tokenizer.decoder = decoder
+
+    tokenizer.add_special_tokens(special_tokens)
+    tokenizer.model.unk_token = unk_token
+
+    # 4. Set post-processor
+    tokenizer.post_processor = TemplateProcessing(
+        single="<s> $A </s>",
+        pair="<s> $A </s> </s> $B </s>",
+        special_tokens=[
+            ("<s>", tokenizer.token_to_id("<s>")),
+            ("</s>", tokenizer.token_to_id("</s>")),
+        ]
+    )
+    # 5. Save the file
+    try:
+        tokenizer.save(path)
+        logger.info(f"Successfully saved Hugging Face tokenizer to {path}")
+    except Exception as e:
+        logger.error(f"Failed to save tokenizer.json to {path}: {e}")
+
 
 def learn_bpe(infiles, outfile, devfiles, num_symbols, min_frequency=2, verbose=False, is_dict=False, total_symbols=False, num_global=0, ratio=None, num_workers=1, bpe_file=None):
     """
@@ -579,7 +679,7 @@ def learn_bpe(infiles, outfile, devfiles, num_symbols, min_frequency=2, verbose=
             If True, subtract number of characters from the symbols to be generated (so that 'num_symbols' becomes an estimate for the total number of symbols needed to encode text). Defaults to False.
         num_global (int, optional): 
             Number of initial merges to perform globally across all corpora before handling them separately. Defaults to 0.
-        ratio (list[float[):
+        ratio (list[float]): 
             Desired ratio of compression (comparing to pre-tokenized length) per input language. Can be used for parity computation in lieu of development set.
         num_workers (int, optional): 
             Number of worker processes to use for parallel computations (if supported). Defaults to 1.
@@ -587,43 +687,44 @@ def learn_bpe(infiles, outfile, devfiles, num_symbols, min_frequency=2, verbose=
             Path to file from which to pre-load BPE merges (to continue learning with different settings, e.g. for SuperBPE).
 
     Returns:
-        None
-            The function writes the learned BPE merge rules to the specified `outfile`.
+        tuple: (vocab, merges) for optional HF tokenizer.json export.
     """
     logger.info("Learning parity-aware BPE with the following parameters:"
           "\n  num_symbols: {0}, min_frequency: {1}, verbose: {2}, is_dict: {3}, total_symbols: {4}, num_global: {5}, num_workers: {6}".format(
               num_symbols, min_frequency, verbose, is_dict, total_symbols, num_global, num_workers))
     
-    # version numbering allows bckward compatibility
+    # --- HF Tokenizer Init ---
+    initial_alphabet = pre_tokenizers.ByteLevel.alphabet()
+    vocab = {token: i for i, token in enumerate(SPECIAL_TOKENS + initial_alphabet)}
+    merges = []
+
+    # version numbering allows backward compatibility
     outfile.write('#version: 0.2\n')
-    dev_vocab, sorted_vocab, stats, indices, big_stats, threshold, lengths, array_length = \
+    dev_vocab, dev_indices, sorted_vocab, stats, word_pair_counts, indices, big_stats, threshold, lengths, array_length = \
         preprocess_input_data(infiles, devfiles, is_dict, total_symbols, num_global, num_workers, bpe_file)
 
-    if not ratio is None:
+    if ratio is not None:
         initial_lengths = functools.reduce(numpy.add, [len(key)*value for key, value in sorted_vocab])
         lengths = numpy.copy(initial_lengths)
 
     for i in tqdm(range(num_symbols), desc="parity-aware BPE..."):
         if stats:
             if i < num_global:
-                if verbose:
-                    sys.stderr.write('lengths {0}: picking best subword based on concatenation\n'.format(lengths))
+                logger.info('lengths {0}: picking best subword based on concatenation'.format(lengths))
                 max_index = -1
 
             else:
-                if not ratio is None:
-                    # we want to find the language with the least compression, adjusted by the user_defined desired ratio
-                    compression_rates = initial_lengths/lengths
-                    adjusted_compression_rates = compression_rates/ratio
+                if ratio is not None:
+                    # find the language with the least compression, adjusted by desired ratio
+                    compression_rates = initial_lengths / lengths
+                    adjusted_compression_rates = compression_rates / ratio
                     max_index, max_value = min(enumerate(adjusted_compression_rates), key=operator.itemgetter(1))
-                    if verbose:
-                        sys.stderr.write('initial lengths  {0}\nlengths {1}\n'.format(initial_lengths, lengths))
-                        sys.stderr.write('compression rates {0}\nadjusted compression rates {1}: picking best subword in corpus {2} \n'.format(compression_rates, adjusted_compression_rates, max_index))
-
+                    logger.info('initial lengths {0}\nlengths {1}'.format(initial_lengths, lengths))
+                    logger.info('compression rates {0}\nadjusted compression rates {1}: picking best subword in corpus {2}'.format(
+                        compression_rates, adjusted_compression_rates, max_index))
                 else:
                     max_index, max_value = max(enumerate(lengths), key=operator.itemgetter(1))
-                    if verbose:
-                        sys.stderr.write('lengths {0}: picking best subword in corpus {1} \n'.format(lengths, max_index))
+                    logger.info('lengths {0}: picking best subword in corpus {1}'.format(lengths, max_index))
 
             most_frequent = max(stats, key=lambda x: (stats[x][max_index], x))
 
@@ -643,26 +744,37 @@ def learn_bpe(infiles, outfile, devfiles, num_symbols, min_frequency=2, verbose=
             sys.stderr.write(f'no pair has frequency >= {min_frequency}. Stopping for language {max_index} with length: {lengths}\n')
             break
 
-        if verbose:
-            sys.stderr.write('pair {0}: {1} {2} -> {1}{2} (frequency {3})\n'.format(i, most_frequent[0], most_frequent[1], stats[most_frequent]))
+        logger.info('pair {0}: {1} {2} -> {1}{2} (frequency {3})'.format(i, most_frequent[0], most_frequent[1], stats[most_frequent]))
 
-        outfile.write('{0} {1}\n'.format(*most_frequent))
+        s1, s2 = most_frequent
+        merged_token = s1 + s2
         
-        changes = replace_pair(most_frequent, sorted_vocab, indices)
+        # Add to merges list
+        merges.append((s1, s2))
+        
+        # Add new merged token to vocab
+        if merged_token not in vocab:
+            vocab[merged_token] = len(vocab)
+        
+        # Write to BPE codes file
+        outfile.write(f"{s1} {s2}\n")
+        
+        changes = replace_pair(most_frequent, sorted_vocab, indices, stats, word_pair_counts)
 
-        if not ratio is None:
+        if ratio is not None:
             length_change = functools.reduce(numpy.add, [(len(c[2])-len(c[1]))*c[3] for c in changes])
             lengths -= length_change
         else:
-            length_change = replace_pair_dict(most_frequent, dev_vocab)
+            length_change = replace_pair_dict(most_frequent, dev_vocab, dev_indices)
             lengths -= length_change
-
-        update_pair_statistics(most_frequent, changes, stats, indices)
         
         if not i % 100:
             prune_stats(stats, big_stats, threshold)
 
         stats[most_frequent] = numpy.zeros(array_length, dtype=int)
+        indices[most_frequent] = defaultdict(int)
+
+    return vocab, merges
     
 
 def select_language_index(lengths, selected_indices, selection_threshold, window_size):
@@ -726,7 +838,7 @@ def learn_bpe_moving_window(infiles, outfile, devfiles, num_symbols, window_size
             If True, subtract number of characters from the symbols to be generated (so that 'num_symbols' becomes an estimate for the total number of symbols needed to encode text). Defaults to False.
         num_global (int, optional): 
             Number of initial merges to perform globally across all corpora before handling them separately. Defaults to 0.
-        ratio (list[float[):
+        ratio (list[float]): 
             Desired ratio of compression (comparing to pre-tokenized length) per input language. Can be used for parity computation in lieu of development set.
         num_workers (int, optional): 
             Number of worker processes to use for parallel computations (if supported). Defaults to 1.
@@ -734,26 +846,30 @@ def learn_bpe_moving_window(infiles, outfile, devfiles, num_symbols, window_size
             Path to file from which to pre-load BPE merges (to continue learning with different settings, e.g. for SuperBPE).
 
     Returns:
-        None
-            The function writes the learned BPE merge rules to the specified `outfile`.
+        tuple: (vocab, merges) for optional HF tokenizer.json export.
     """
     logger.info("Using Parity-aware BPE (moving-window variant) with window size {0} and alpha {1}".format(window_size, alpha))
     logger.info("Learning parity-aware BPE with the following parameters:"
           "\n  num_symbols: {0}, min_frequency: {1}, verbose: {2}, is_dict: {3}, total_symbols: {4}, num_global: {5}, num_workers: {6}".format(
               num_symbols, min_frequency, verbose, is_dict, total_symbols, num_global, num_workers))
     
+    # --- HF Tokenizer Init ---
+    initial_alphabet = pre_tokenizers.ByteLevel.alphabet()
+    vocab = {token: i for i, token in enumerate(SPECIAL_TOKENS + initial_alphabet)}
+    merges = []
+
     # if continuing learning on top of existing BPE file, contents of BPE file are included in output
     if bpe_file:
         outfile.write(bpe_file.read())
         bpe_file.seek(0)
     else:
-        # version numbering allows bckward compatibility
+        # version numbering allows backward compatibility
         outfile.write('#version: 0.2\n')
 
-    dev_vocab, sorted_vocab, stats, indices, big_stats, threshold, lengths, array_length = \
+    dev_vocab, dev_indices, sorted_vocab, stats, word_pair_counts, indices, big_stats, threshold, lengths, array_length = \
         preprocess_input_data(infiles, devfiles, is_dict, total_symbols, num_global, num_workers, bpe_file)
 
-    if not ratio is None:
+    if ratio is not None:
         initial_lengths = functools.reduce(numpy.add, [len(key)*value for key, value in sorted_vocab])
         lengths = numpy.copy(initial_lengths)
 
@@ -763,29 +879,23 @@ def learn_bpe_moving_window(infiles, outfile, devfiles, num_symbols, window_size
     for i in tqdm(range(num_symbols), desc="Parity-aware BPE (moving-window variant)... \n"):
         if stats:
             if i < num_global:
-                if verbose:
-                    sys.stderr.write('lengths {0}: picking best subword based on concatenation\n'.format(lengths))
+                logger.info('lengths {0}: picking best subword based on concatenation'.format(lengths))
                 max_index = -1
 
             else:
-                if not ratio is None:
-                    # we want to find the language with the least compression, adjusted by the user_defined desired ratio
-                    compression_rates = initial_lengths/lengths
-                    adjusted_compression_rates = compression_rates/ratio
-                    # if verbose:
-                        # sys.stderr.write('initial lengths  {0}\nlengths {1}\n'.format(initial_lengths, lengths))
-                        # sys.stderr.write('compression rates {0}\nadjusted compression rates {1}\n'.format(compression_rates, adjusted_compression_rates))
+                if ratio is not None:
+                    # find the language with the least compression, adjusted by desired ratio
+                    compression_rates = initial_lengths / lengths
+                    adjusted_compression_rates = compression_rates / ratio
                     max_index = select_language_index(-adjusted_compression_rates, selected_indices, selection_threshold, window_size)
                     selected_indices.append(max_index)
-                    if verbose:
-                        sys.stderr.write('initial lengths  {0}\nlengths {1}\n'.format(initial_lengths, lengths))
-                        sys.stderr.write('compression rates {0}\nadjusted compression rates {1}: picking best subword in corpus {2} \n'.format(compression_rates, adjusted_compression_rates, max_index))
-
+                    logger.info('initial lengths {0}\nlengths {1}'.format(initial_lengths, lengths))
+                    logger.info('compression rates {0}\nadjusted compression rates {1}: picking best subword in corpus {2}'.format(
+                        compression_rates, adjusted_compression_rates, max_index))
                 else:
                     max_index = select_language_index(lengths, selected_indices, selection_threshold, window_size)
                     selected_indices.append(max_index)
-                    if verbose:
-                        sys.stderr.write('lengths {0}: picking best subword in corpus {1} \n'.format(lengths, max_index))
+                    logger.info('lengths {0}: picking best subword in corpus {1}'.format(lengths, max_index))
 
             most_frequent = max(stats, key=lambda x: (stats[x][max_index], x))
 
@@ -805,26 +915,37 @@ def learn_bpe_moving_window(infiles, outfile, devfiles, num_symbols, window_size
             sys.stderr.write(f'no pair has frequency >= {min_frequency}. Stopping for language {max_index} with length: {lengths}\n')
             break
 
-        if verbose:
-            sys.stderr.write('pair {0}: {1} {2} -> {1}{2} (frequency {3})\n'.format(i, most_frequent[0], most_frequent[1], stats[most_frequent]))
+        logger.info('pair {0}: {1} {2} -> {1}{2} (frequency {3})'.format(i, most_frequent[0], most_frequent[1], stats[most_frequent]))
 
-        outfile.write('{0} {1}\n'.format(*most_frequent))
+        s1, s2 = most_frequent
+        merged_token = s1 + s2
         
-        changes = replace_pair(most_frequent, sorted_vocab, indices)
+        # Add to merges list
+        merges.append((s1, s2))
+        
+        # Add new merged token to vocab
+        if merged_token not in vocab:
+            vocab[merged_token] = len(vocab)
+        
+        # Write to BPE codes file
+        outfile.write(f"{s1} {s2}\n")
 
-        if not ratio is None:
+        changes = replace_pair(most_frequent, sorted_vocab, indices, stats, word_pair_counts)
+
+        if ratio is not None:
             length_change = functools.reduce(numpy.add, [(len(c[2])-len(c[1]))*c[3] for c in changes])
             lengths -= length_change
         else:
-            length_change = replace_pair_dict(most_frequent, dev_vocab)
+            length_change = replace_pair_dict(most_frequent, dev_vocab, dev_indices)
             lengths -= length_change
-
-        update_pair_statistics(most_frequent, changes, stats, indices)
         
         if not i % 100:
             prune_stats(stats, big_stats, threshold)
 
         stats[most_frequent] = numpy.zeros(array_length, dtype=int)
+        indices[most_frequent] = defaultdict(int)
+    
+    return vocab, merges
 
 if __name__ == '__main__':
 
@@ -843,9 +964,10 @@ if __name__ == '__main__':
     sys.stdout = codecs.getwriter('UTF-8')(sys.stdout.buffer)
     sys.stdin = codecs.getreader('UTF-8')(sys.stdin.buffer)
 
+    set_logger(args.verbose)
+
     if args.num_workers <= 0:
-        args.num_workers = cpu_count()
-    
+        args.num_workers = cpu_count() - 1
     
     if sys.version_info < (3, 0):
         print("Python 2 is deprecated. Use Python 3")
@@ -859,8 +981,8 @@ if __name__ == '__main__':
         assert(args.dev is None)
         assert(len(args.input) == len(args.ratio))
         args.ratio = numpy.array(args.ratio)
-        #normalize ratios by first value given
-        args.ratio = args.ratio/args.ratio[0]
+        # normalize ratios by first value given
+        args.ratio = args.ratio / args.ratio[0]
 
     if args.dev is None and args.ratio is None:
         print("script requires either dev sets or ratios")
@@ -880,24 +1002,27 @@ if __name__ == '__main__':
     else:
         bpe_file = codecs.open(args.preload.name, encoding='utf-8')
 
-
+    # Configure pre-tokenizer from CLI args
     pretokenizer_list = []
-    for pretokenizer in args.pretokenize:
-        if pretokenizer == 'whitespace':
+    for pt in args.pretokenize:
+        if pt == 'whitespace':
             pretokenizer_list.append(Whitespace())
-        elif pretokenizer == 'bytelevel':
+        elif pt == 'bytelevel':
             pretokenizer_list.append(ByteLevel(use_regex=False))
         else:
-            raise ValueError("pretokenizer {0} is not implemented".format(pretokenizer))
+            raise ValueError("pretokenizer {0} is not implemented".format(pt))
 
     pre_tokenizer = pre_tokenizers.Sequence(pretokenizer_list)
 
     if args.variant == 'base':
-        learn_bpe(args.input, args.output, args.dev, args.symbols, args.min_frequency, args.verbose, num_global=args.global_merges, is_dict=args.dict_input, total_symbols=args.total_symbols, ratio=args.ratio, num_workers=args.num_workers, bpe_file=bpe_file)
+        vocab, merges = learn_bpe(args.input, args.output, args.dev, args.symbols, args.min_frequency, args.verbose, num_global=args.global_merges, is_dict=args.dict_input, total_symbols=args.total_symbols, ratio=args.ratio, num_workers=args.num_workers, bpe_file=bpe_file)
     elif args.variant == 'window':
-        learn_bpe_moving_window(args.input, args.output, args.dev, args.symbols, args.window_size, args.alpha, args.min_frequency, args.verbose, num_global=args.global_merges, is_dict=args.dict_input, total_symbols=args.total_symbols, ratio=args.ratio, num_workers=args.num_workers, bpe_file=bpe_file)
+        vocab, merges = learn_bpe_moving_window(args.input, args.output, args.dev, args.symbols, args.window_size, args.alpha, args.min_frequency, args.verbose, num_global=args.global_merges, is_dict=args.dict_input, total_symbols=args.total_symbols, ratio=args.ratio, num_workers=args.num_workers, bpe_file=bpe_file)
     else:
         raise ValueError("Unknown BPE variant: {0}. Use 'base' or 'window'.".format(args.variant))
+
+    if args.json_output and vocab and merges:
+        save_tokenizer_json(args.json_output, vocab, merges)
 
     # close files
     for f in args.input:
