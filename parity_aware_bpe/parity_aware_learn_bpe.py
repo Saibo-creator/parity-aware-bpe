@@ -297,26 +297,79 @@ def pre_merge(vocab, bpe_codes):
     return new_vocab
 
 
-def get_pair_statistics(vocab):
+def _process_vocab_chunk(chunk_data):
+    """Process a chunk of vocab and return local stats and indices."""
+    vocab_chunk, start_idx, array_len = chunk_data
+
+    local_stats = {}
+    local_indices = {}
+
+    for local_i, (word, freq) in enumerate(vocab_chunk):
+        global_i = start_idx + local_i
+        for p in zip(word[0:-1], word[1:]):
+            if p not in local_stats:
+                local_stats[p] = numpy.zeros(array_len, dtype=int)
+                local_indices[p] = {}
+            local_stats[p] += freq
+            if global_i not in local_indices[p]:
+                local_indices[p][global_i] = 0
+            local_indices[p][global_i] += 1
+
+    return local_stats, local_indices
+
+
+def get_pair_statistics(vocab, num_workers=1):
     """ Counts frequency of all symbol pairs, and create index.
     Args:
         vocab (list): A list of tuples, where each tuple contains a word (as a tuple of characters) and its frequency in each language.
+        num_workers (int): Number of parallel workers (default: 1 for single-threaded).
     Returns:
         tuple: A tuple containing two dictionaries:
             - stats (defaultdict): A dictionary mapping symbol pairs (tuples) to their frequencies (numpy arrays).
             - indices (defaultdict): A dictionary mapping symbol pairs (tuples) to their indices (defaultdicts).
     """
+    if not vocab:
+        return defaultdict(lambda: numpy.zeros(1, dtype=int)), defaultdict(lambda: defaultdict(int))
 
-    # data structure of pair frequencies
-    stats = defaultdict(lambda: numpy.zeros(len(vocab[0][1]),dtype=int))
+    array_len = len(vocab[0][1])
 
-    #index from pairs to words
+    # Single-threaded version
+    if num_workers <= 1:
+        stats = defaultdict(lambda: numpy.zeros(array_len, dtype=int))
+        indices = defaultdict(lambda: defaultdict(int))
+
+        for i, (word, freq) in tqdm(enumerate(vocab), total=len(vocab), desc="Computing pair statistics"):
+            for p in zip(word[0:-1], word[1:]):
+                stats[p] += freq
+                indices[p][i] += 1
+
+        return stats, indices
+
+    # Parallel version
+    chunk_size = max(1000, len(vocab) // num_workers)
+    chunks = []
+    for i in range(0, len(vocab), chunk_size):
+        chunk = vocab[i:i + chunk_size]
+        chunks.append((chunk, i, array_len))
+
+    print(f"Computing pair statistics with {num_workers} workers ({len(chunks)} chunks)...")
+
+    pool = Pool(processes=num_workers)
+    results = list(tqdm(pool.imap(_process_vocab_chunk, chunks),
+                       total=len(chunks), desc="Computing pair statistics"))
+    pool.close()
+    pool.join()
+
+    # Merge results
+    stats = defaultdict(lambda: numpy.zeros(array_len, dtype=int))
     indices = defaultdict(lambda: defaultdict(int))
 
-    for i, (word, freq) in enumerate(vocab):
-        for p in zip(word[0:-1], word[1:]):
+    for local_stats, local_indices in results:
+        for p, freq in local_stats.items():
             stats[p] += freq
-            indices[p][i] += 1
+        for p, idx_dict in local_indices.items():
+            for idx, count in idx_dict.items():
+                indices[p][idx] += count
 
     return stats, indices
 
@@ -332,6 +385,11 @@ def count_adjacent_pairs_tuple(word):
         d[key] = d.get(key, 0) + 1
         prev = cur
     return d
+
+
+def _compute_word_pair_counts_chunk(words):
+    """Worker function to compute pair counts for a chunk of words."""
+    return [count_adjacent_pairs_tuple(word) for word in words]
 
 def replace_pair(pair, vocab, indices, stats, word_pair_counts):
     """
@@ -578,15 +636,40 @@ def preprocess_input_data(infiles, devfiles, is_dict=False, total_symbols=False,
             dev_indices[p].add(word)
 
     sorted_vocab = sorted(vocab.items(), key=lambda x: sum(x[1]), reverse=True)
-    stats, indices = get_pair_statistics(sorted_vocab)
+    stats, indices = get_pair_statistics(sorted_vocab, num_workers=num_workers)
+
+    print("Creating backup of statistics...")
     big_stats = copy.deepcopy(stats)
 
-    word_pair_counts = [count_adjacent_pairs_tuple(word) for (word, _freq) in sorted_vocab]
+    print("Computing word-level pair counts...")
+    if num_workers <= 1 or len(sorted_vocab) < 10000:
+        # Single-threaded version
+        word_pair_counts = [count_adjacent_pairs_tuple(word) for (word, _freq) in tqdm(sorted_vocab, desc="Word pair counts")]
+    else:
+        # Parallel version
+        words = [word for (word, _freq) in sorted_vocab]
+        chunk_size = max(1000, len(words) // num_workers)
+        chunks = [words[i:i + chunk_size] for i in range(0, len(words), chunk_size)]
+
+        pool = Pool(processes=num_workers)
+        results = list(tqdm(
+            pool.imap(_compute_word_pair_counts_chunk, chunks),
+            total=len(chunks),
+            desc=f"Word pair counts ({num_workers} workers)"
+        ))
+        pool.close()
+        pool.join()
+
+        # Flatten results
+        word_pair_counts = []
+        for chunk_result in results:
+            word_pair_counts.extend(chunk_result)
 
     if total_symbols:
+        print("Analyzing character distribution...")
         uniq_char_internal = set()
         uniq_char_final = set()
-        for word in vocab:
+        for word in tqdm(vocab, desc="Character analysis"):
             for char in word[:-1]:
                 uniq_char_internal.add(char)
             uniq_char_final.add(word[-1])
@@ -596,11 +679,13 @@ def preprocess_input_data(infiles, devfiles, is_dict=False, total_symbols=False,
         # num_symbols -= len(uniq_char_internal) + len(uniq_char_final)
 
     # threshold is inspired by Zipfian assumption, but should only affect how often we re-sync with full big_stats
+    print("Computing pruning thresholds...")
     threshold = numpy.zeros(array_length, dtype=float)
-    for l in range(array_length):
+    for l in tqdm(range(array_length), desc="Thresholds"):
         threshold[l] = stats[max(stats, key=lambda x: (stats[x][l], x))][l] / 10
 
     if dev_vocab:
+        print("Computing development set lengths...")
         lengths = functools.reduce(numpy.add, [len(key)*value for key, value in dev_vocab.items()])
     else:
         lengths = None
@@ -704,9 +789,11 @@ def learn_bpe(infiles, outfile, devfiles, num_symbols, min_frequency=2, verbose=
         preprocess_input_data(infiles, devfiles, is_dict, total_symbols, num_global, num_workers, bpe_file)
 
     if ratio is not None:
+        print("Computing initial compression ratios...")
         initial_lengths = functools.reduce(numpy.add, [len(key)*value for key, value in sorted_vocab])
         lengths = numpy.copy(initial_lengths)
 
+    print(f"Starting BPE training loop ({num_symbols} merges)...")
     for i in tqdm(range(num_symbols), desc="parity-aware BPE..."):
         if stats:
             if i < num_global:
